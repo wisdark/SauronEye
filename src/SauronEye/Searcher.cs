@@ -67,8 +67,12 @@ namespace SauronEye {
                                         );
 
                 }
-                return dirFiles.Concat(Directory.EnumerateFiles(path, searchPattern));
+                return dirFiles.Concat(Directory.EnumerateFiles(path, searchPattern).Where(fi => EndsWithExtension(fi)));
             } catch (UnauthorizedAccessException ex) {
+                return Enumerable.Empty<string>();
+            } catch (PathTooLongException ex) {
+                // Microsoft solution: https://docs.microsoft.com/en-us/dotnet/standard/io/how-to-enumerate-directories-and-files
+                Console.WriteLine("[!] {0} is too long. Continuing with next directory.", path);
                 return Enumerable.Empty<string>();
             }
         }
@@ -108,7 +112,7 @@ namespace SauronEye {
     }
 
 
-    class ContentsSearcher {
+    public class ContentsSearcher {
 
         private IEnumerable<string> Directories;
         private List<string> Keywords;
@@ -124,25 +128,35 @@ namespace SauronEye {
 
         // Searches the contents of filtered files. Does not care about exceptions.
         public void Search() {
-            foreach (String dir in Directories) { 
-                var fileInfo = new FileInfo(dir);
-                string fileContents;
-                if (fileInfo.Length < MAX_FILE_SIZE) {
-                    if (IsOfficeExtension(fileInfo.Extension)) {
-                        try {
-                            var reader = new FilterReader(fileInfo.FullName);
-                            fileContents = reader.ReadToEnd();
-                            CheckForKeywords(fileContents, fileInfo);
-                        } catch (Exception e) { Console.WriteLine("[-] Could not read contents of {0}", fileInfo.FullName); }
-                    } else {
-                        //normal file
-                        try {
-                            CheckForKeywords(File.ReadAllText(fileInfo.FullName), fileInfo);
-                        } catch (Exception e) { Console.WriteLine("[-] Could not read contents of {0}", fileInfo.FullName); }
+            foreach (String dir in Directories) {
+                try {
+                    var NTdir = @"\\?\" + dir;
+                    var fileInfo = new FileInfo(NTdir);
 
+                    string fileContents;
+                    if (fileInfo.Length < MAX_FILE_SIZE) {
+                        if (IsOfficeExtension(fileInfo.Extension)) {
+                            try {
+                                var reader = new FilterReader(fileInfo.FullName);
+                                fileContents = reader.ReadToEnd();
+                                CheckForKeywords(fileContents, fileInfo);
+                            } catch (Exception e) { Console.WriteLine("[-] Could not read contents of {0}", fileInfo.FullName.Replace(@"\\?\", "")); }
+                        } else {
+                            //normal file
+                            try {
+                                CheckForKeywords(File.ReadAllText(fileInfo.FullName), fileInfo);
+                            } catch (Exception e) {
+                                Console.WriteLine("[-] Could not read contents of {0}", fileInfo.FullName.Replace(@"\\?\", "")); }
+
+                        }
+                    } else {
+                        Console.WriteLine("[-] File exceeds 1MB file size {0}", fileInfo.FullName.Replace(@"\\?\", ""));
                     }
-                } else {
-                    Console.WriteLine("[-] File exceeds 1MB file size {0}", fileInfo.FullName);
+                } catch (PathTooLongException ex) {
+                    Console.WriteLine("[-] Path {0} is too long. Skipping.", dir);
+                    continue;
+                } catch (Exception e) {
+                    Console.WriteLine("[-] Some unknown exception {0} occured while processing {1}. Continuing with the next directory.", e.Message, dir);
                 }
             }
         }
@@ -153,10 +167,10 @@ namespace SauronEye {
                 // Office docs are weird, do not contains newlines when extracted.
                 var found = HasKeywordInLargeString(contents);
                 if (!found.Equals("")) {
-                    Console.WriteLine("[+] {0}: \n\t {1}\n", fileInfo.FullName, found);
+                    Console.WriteLine("[+] {0}: \n\t {1}\n", fileInfo.FullName.Replace(@"\\?\", ""), found);
                 }
             } catch (Exception e) {
-                Console.WriteLine("[!] The {0} could not be read.", fileInfo.FullName);
+                Console.WriteLine("[!] The {0} could not be read.", fileInfo.FullName.Replace(@"\\?\", ""));
             }
         }
 
@@ -168,17 +182,21 @@ namespace SauronEye {
                 if (ContainsAny(splitted[i].ToLower())) {
                     if (i >= 2 && i + 2 <= splitted.Length) {
                         // word1 word2 keyword word3 word4
-                        res = Regex.Replace(string.Join(" ", splitted, i - 2, 5), @"\t|\n|\r", " "); 
+                        res += Regex.Replace(string.Join(" ", splitted, i - 2, 4), @"\t|\n|\r", " ");
+                        //res += Regex.Replace(string.Join(" ", splitted, i - 2, 4), @"\t|\n|\r", " ") + ", ";
                         //res = splitted[i - 2] + splitted[i - 1] + splitted[i] + splitted[i + 1] + splitted[i + 2];
-                    } else if (i + 2 <= splitted.Length) {
+                    } else if (i + 2 < splitted.Length) {
                         // keyword word1 word2
-                        res = Regex.Replace(string.Join(" ", splitted, i, 2) + string.Join(" ", splitted.Skip(i)), @"\t|\n|\r", " ");
+                        res += Regex.Replace(string.Join(" ", splitted, i, 2) + string.Join(" ", splitted.Skip(i)), @"\t|\n|\r", " ");
+                        //res += Regex.Replace(string.Join(" ", splitted, i, 2) + string.Join(" ", splitted.Skip(i)), @"\t|\n|\r", " ") + ", ";
                     } else if (i >= 2) {
                         // word1 word2 keyword
-                        res = Regex.Replace(string.Join(" ", splitted, i - 2 , 3) + string.Join(" ", splitted.Skip(i)), @"\t|\n|\r", " ");
+                        //res += string.Join(" ", splitted, i - 2, 2) + " " + splitted[i];
+                        res += Regex.Replace(string.Join(" ", splitted, i - 2, 2) + " " + splitted[i], @"\t|\n|\r", " ");
+                        //res = Regex.Replace(string.Join(" ", splitted, i - 2, 2) + " " + splitted[i], @"\t|\n|\r", " ") + ", ";
                     } else {
-
-                        res = Regex.Replace(string.Join(" ", splitted, i, 1) + string.Join(" ", splitted.Skip(i)), @"\t|\n|\r", " ");
+                        //res += string.Join(" ", splitted, i, 1) + string.Join(" ", splitted.Skip(i));
+                        res += Regex.Replace(string.Join(" ", splitted, i, 1) + string.Join(" ", splitted.Skip(i)), @"\t|\n|\r", " ") + ", ";
                     }
                 }
             }
