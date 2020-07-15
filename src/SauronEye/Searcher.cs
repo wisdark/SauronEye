@@ -15,23 +15,39 @@ namespace SauronEye {
      */
     class FSSearcher {
 
+        private static readonly string[] Office2003Extentions = { ".doc", ".xls" };
         private string SearchDirectory;
         private List<string> Filetypes;
         private List<string> Keywords;
         private List<string> Results;
         private bool searchContents;
         private bool SystemDirs;
+        private UInt64 maxFileSizeInKB;
         private IEnumerable<string> FilesFilteredOnExtension;
         private RegexSearch RegexSearcher;
+        private DateTime BeforeDate;
+        private DateTime AfterDate;
+        private bool CheckForMacro;
+        private OLEExplorer OLXExplorer;
 
-        public FSSearcher(string d, List<string> f, List<string> k, bool s, bool systemdirs, RegexSearch regex) {
+
+        public FSSearcher(string d, List<string> f, List<string> k, bool s, UInt64 maxfs, bool systemdirs, RegexSearch regex, DateTime beforedate, DateTime afterdate, bool CheckForMacro) {
             this.SearchDirectory = d;
             this.Filetypes = f;
             this.Keywords = k;
             this.Results = new List<string>();
             this.searchContents = s;
+            this.maxFileSizeInKB = maxfs;
             this.SystemDirs = systemdirs;
             this.RegexSearcher = regex;
+            if (beforedate != null) {
+                this.BeforeDate = beforedate;
+            }
+            if (afterdate != null) {
+                this.AfterDate = afterdate;
+            }
+            this.CheckForMacro = CheckForMacro;
+            this.OLXExplorer = null;
         }
 
 
@@ -44,14 +60,32 @@ namespace SauronEye {
                         Results.Add(filepath);
                     }
                 }
+                if (CheckForMacro) {
+                    OLXExplorer = new OLEExplorer();
+                }
                 foreach (string i in Results) {
-                    Console.WriteLine("[+] {0}", i);
+                    bool containsVBA = false;
+                    if (CheckForMacro && EndsWithOffice2003Extension(i)) {
+                        containsVBA = OLXExplorer.CheckForVBAMacros(i);
+                        if (!containsVBA)
+                            continue;
+                    }
+                    if (BeforeDate != DateTime.MinValue || AfterDate != DateTime.MinValue) {
+                        if (MatchesLastWrite(i)) {
+                            Console.WriteLine("[+] {0}", i);
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        Console.WriteLine("[+] {0}", i);
+                    }
+                    
                 }
 
                 // Now search contents
                 if (searchContents) {
                     Console.WriteLine("[*] Done searching file system, now searching contents");
-                    var contentsSearcher = new ContentsSearcher(FilesFilteredOnExtension, Keywords, RegexSearcher);
+                    var contentsSearcher = new ContentsSearcher(FilesFilteredOnExtension, Keywords, RegexSearcher, this.maxFileSizeInKB);
                     contentsSearcher.Search();
                 }
             }
@@ -68,12 +102,18 @@ namespace SauronEye {
 
                 }
                 return dirFiles.Concat(Directory.EnumerateFiles(path, searchPattern).Where(fi => EndsWithExtension(fi)));
+
             } catch (UnauthorizedAccessException ex) {
                 return Enumerable.Empty<string>();
+
             } catch (PathTooLongException ex) {
                 // Microsoft solution: https://docs.microsoft.com/en-us/dotnet/standard/io/how-to-enumerate-directories-and-files
                 Console.WriteLine("[!] {0} is too long. Continuing with next directory.", path);
                 return Enumerable.Empty<string>();
+
+            } catch (System.IO.IOException ex) {
+                return Enumerable.Empty<string>();
+
             }
         }
 
@@ -101,9 +141,30 @@ namespace SauronEye {
             return (p.Contains(":\\Windows") || (p.Contains(":\\Users") && p.Contains("\\AppData"))) == false;
         }
 
+        public bool MatchesLastWrite(string path) {
+            FileInfo fi = new FileInfo(path);
+            var lastmodified = fi.LastWriteTime;
+            if (BeforeDate != DateTime.MinValue && lastmodified.Date < BeforeDate.Date) {
+                return true;
+            }
+            if (AfterDate != DateTime.MinValue && lastmodified.Date > AfterDate.Date) {
+                return true;
+            }
+            return false;
+        }
+
         private bool EndsWithExtension(string path) {
             foreach (string ext in Filetypes) {
                 if (path.ToLower().EndsWith(ext.ToLower())) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private bool EndsWithOffice2003Extension(string path) {
+            foreach (string OfficeExt in Office2003Extentions) {
+                if ((path.ToLower().EndsWith(OfficeExt))) {
                     return true;
                 }
             }
@@ -116,41 +177,41 @@ namespace SauronEye {
 
         private IEnumerable<string> Directories;
         private List<string> Keywords;
-        private int MAX_FILE_SIZE = 1000000; // 1MB
+        private UInt64 MAX_FILE_SIZE;
         private static readonly string[] OfficeExtentions = { ".doc", ".docx", ".xls", ".xlsx" };
         private RegexSearch RegexSearcher;
 
-        public ContentsSearcher(IEnumerable<string> directories, List<string> keywords, RegexSearch regex) {
+        public ContentsSearcher(IEnumerable<string> directories, List<string> keywords, RegexSearch regex, UInt64 maxFileSizeInKB) {
             this.Directories = directories;
             this.Keywords = keywords;
             this.RegexSearcher = regex;
+            this.MAX_FILE_SIZE = maxFileSizeInKB;
         }
 
         // Searches the contents of filtered files. Does not care about exceptions.
         public void Search() {
             foreach (String dir in Directories) {
-                try {
-                    var NTdir = @"\\?\" + dir;
-                    var fileInfo = new FileInfo(NTdir);
+                try { 
+                    var fileInfo = new FileInfo(ConvertToNTPath(dir));
 
                     string fileContents;
-                    if (fileInfo.Length < MAX_FILE_SIZE) {
+                    if (Convert.ToUInt64(fileInfo.Length) < 1024 * this.MAX_FILE_SIZE) {
                         if (IsOfficeExtension(fileInfo.Extension)) {
                             try {
                                 var reader = new FilterReader(fileInfo.FullName);
                                 fileContents = reader.ReadToEnd();
                                 CheckForKeywords(fileContents, fileInfo);
-                            } catch (Exception e) { Console.WriteLine("[-] Could not read contents of {0}", fileInfo.FullName.Replace(@"\\?\", "")); }
+                            } catch (Exception e) { Console.WriteLine("[-] Could not read contents of {0}", PrettyPrintNTPath(fileInfo.FullName)); }
                         } else {
                             //normal file
                             try {
                                 CheckForKeywords(File.ReadAllText(fileInfo.FullName), fileInfo);
                             } catch (Exception e) {
-                                Console.WriteLine("[-] Could not read contents of {0}", fileInfo.FullName.Replace(@"\\?\", "")); }
+                                Console.WriteLine("[-] Could not read contents of {0}", PrettyPrintNTPath(fileInfo.FullName)); }
 
                         }
                     } else {
-                        Console.WriteLine("[-] File exceeds 1MB file size {0}", fileInfo.FullName.Replace(@"\\?\", ""));
+                        Console.WriteLine("[-] File exceeds max file size {0}", PrettyPrintNTPath(fileInfo.FullName));
                     }
                 } catch (PathTooLongException ex) {
                     Console.WriteLine("[-] Path {0} is too long. Skipping.", dir);
@@ -161,43 +222,53 @@ namespace SauronEye {
             }
         }
 
+        // Converts DOS path to NT path to support > 260 chars. Also takes into account UNC for shares with '$' signs in them.
+        private String ConvertToNTPath(String path) {
+            if (path.StartsWith(@"\\")) {
+                return @"\\?\UNC\" + path.TrimStart('\\');
+            } else {
+                return @"\\?\" + path;
+            }
+        }
+
+        // Remove NT prefixes
+        private String PrettyPrintNTPath(String NTPath) {
+            if (NTPath.StartsWith(@"\\?\UNC\")) {
+                return NTPath.Replace(@"\\?\UNC\", @"\\");
+            } else if (NTPath.StartsWith(@"\\?\")) {
+                return NTPath.Replace(@"\\?\", "");
+            } else {
+                return NTPath;
+            }
+        }
+
         // Prints the file and keyword iff a keyword is found in its contents.
         private void CheckForKeywords(string contents, FileInfo fileInfo) {
             try {
                 // Office docs are weird, do not contains newlines when extracted.
                 var found = HasKeywordInLargeString(contents);
                 if (!found.Equals("")) {
-                    Console.WriteLine("[+] {0}: \n\t {1}\n", fileInfo.FullName.Replace(@"\\?\", ""), found);
+                    Console.WriteLine("[+] {0}: \n\t {1}\n", PrettyPrintNTPath(fileInfo.FullName), found);
                 }
             } catch (Exception e) {
-                Console.WriteLine("[!] The {0} could not be read.", fileInfo.FullName.Replace(@"\\?\", ""));
+                Console.WriteLine("[!] The {0} could not be read.", PrettyPrintNTPath(fileInfo.FullName));
             }
         }
 
         // Checks if a string contains any of the keywords we're looking for and returns keyword incl. limited context
-        private string HasKeywordInLargeString(string keywordLine) {
+        public string HasKeywordInLargeString(string keywordLine) {
             var res = "";
-            var splitted = keywordLine.Split(' ');
-            for (int i = 0; i < splitted.Length; i++) {
-                if (ContainsAny(splitted[i].ToLower())) {
-                    if (i >= 2 && i + 2 <= splitted.Length) {
-                        // word1 word2 keyword word3 word4
-                        res += Regex.Replace(string.Join(" ", splitted, i - 2, 4), @"\t|\n|\r", " ");
-                        //res += Regex.Replace(string.Join(" ", splitted, i - 2, 4), @"\t|\n|\r", " ") + ", ";
-                        //res = splitted[i - 2] + splitted[i - 1] + splitted[i] + splitted[i + 1] + splitted[i + 2];
-                    } else if (i + 2 < splitted.Length) {
-                        // keyword word1 word2
-                        res += Regex.Replace(string.Join(" ", splitted, i, 2) + string.Join(" ", splitted.Skip(i)), @"\t|\n|\r", " ");
-                        //res += Regex.Replace(string.Join(" ", splitted, i, 2) + string.Join(" ", splitted.Skip(i)), @"\t|\n|\r", " ") + ", ";
-                    } else if (i >= 2) {
-                        // word1 word2 keyword
-                        //res += string.Join(" ", splitted, i - 2, 2) + " " + splitted[i];
-                        res += Regex.Replace(string.Join(" ", splitted, i - 2, 2) + " " + splitted[i], @"\t|\n|\r", " ");
-                        //res = Regex.Replace(string.Join(" ", splitted, i - 2, 2) + " " + splitted[i], @"\t|\n|\r", " ") + ", ";
-                    } else {
-                        //res += string.Join(" ", splitted, i, 1) + string.Join(" ", splitted.Skip(i));
-                        res += Regex.Replace(string.Join(" ", splitted, i, 1) + string.Join(" ", splitted.Skip(i)), @"\t|\n|\r", " ") + ", ";
-                    }
+            int buffer = 15;
+            foreach (string keyword in Keywords) {
+                //int location = keywordLine.IndexOf(keyword);
+                int location = ContainsAny(keywordLine);
+                while (location != -1) {
+                    // take buffer before and after:
+                    int start = location - Math.Min(buffer, location); // don't take before start
+                    int end = location + keyword.Length
+                            + Math.Min(buffer, keywordLine.Length - location - keyword.Length); // don't take after end
+                    res += "..." + keywordLine.Substring(start, end - start) + "... ";
+                    location = keywordLine.IndexOf(keyword, location + 1);
                 }
             }
             return res;
@@ -205,14 +276,13 @@ namespace SauronEye {
 
 
         // Return true iff contents contain any of the keywords.
-        private bool ContainsAny(string contents) {
-            foreach (string keyword in Keywords) {
-                //if (contents.Contains(keyword)) {
-                if (RegexSearcher.checkForRegexPatterns(contents.ToLower())) {
-                    return true;
-                }
+        private int ContainsAny(string contents) {
+            var res = -1;
+            res = RegexSearcher.GetIndexOfRegexPattern(contents.ToLower());
+            if (res != -1) {
+                return res;
             }
-            return false;
+            return res;
         }
 
         private bool IsOfficeExtension(string ext) {
